@@ -89,24 +89,38 @@ def generate_test_data(B: int, dim: int, min_length: int, max_length: int, dtype
 
 
 if __name__ == "__main__":
+    import statistics
+
     B = 128
     dim = 256
     min_length = 10
     max_length = 200
 
     x0, x1, cu0, cu1 = generate_test_data(B, dim, min_length, max_length)
-    L0 = x0.shape[0]
-    L1 = x1.shape[0]
-
     out_ref = merge_varlen_ref(x0, x1, cu0, cu1)
     out = merge_varlen(x0, x1, cu0, cu1)
     assert (out == out_ref).all()
 
-    def benchmark(f, name):
-        latency_ms = do_bench(lambda: f(x0, x1, cu0, cu1), warmup=50, rep=100, return_mode="median")
-        membw = (x0.nbytes + x1.nbytes + cu0.nbytes + cu1.nbytes + out_ref.nbytes) / (latency_ms * 1e-3) * 1e-9
-        print(f"{name}: {latency_ms:.4f} ms, {membw:.2f} GB/s")
+    def benchmark(f, *args):
+        latency_us = do_bench(lambda: f(*args), warmup=50, rep=100, return_mode="median") * 1e3
+        membw = (x0.nbytes + x1.nbytes + cu0.nbytes + cu1.nbytes + out_ref.nbytes) / (latency_us * 1e-6) * 1e-9
+        return latency_us, membw
 
-    print(f"{L0=}, {L1=}")
-    benchmark(merge_varlen_ref, "Reference")
-    benchmark(merge_varlen, "Triton")
+    data_ref = []
+    data = []
+
+    for _ in range(10):
+        x0, x1, cu0, cu1 = generate_test_data(B, dim, min_length, max_length)
+        data_ref.append(benchmark(merge_varlen_ref, x0, x1, cu0, cu1))
+        data.append(benchmark(merge_varlen, x0, x1, cu0, cu1))
+
+    def get_stat(data: list):
+        mean = statistics.mean(data)
+        std = statistics.stdev(data)
+        return f"{mean:6.2f} ± {std:5.2f}"
+
+    latency_ref, membw_ref = zip(*data_ref)
+    print(f"Reference: {get_stat(latency_ref)} us, {get_stat(membw_ref)} GB/s")
+
+    latency, membw = zip(*data)
+    print(f"Triton:    {get_stat(latency)} us, {get_stat(membw)} GB/s")
