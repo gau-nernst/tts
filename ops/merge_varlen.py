@@ -81,7 +81,7 @@ def merge_varlen(embd0: Tensor, embd1: Tensor, rope0: Tensor, rope1: Tensor, cu0
     B = cu0.shape[0] - 1
 
     embd_out = embd0.new_empty(L0 + L1, D_embed)
-    rope_out = embd0.new_empty(L0 + L1, D_rope)
+    rope_out = rope0.new_empty(L0 + L1, D_rope)
     cu_out = torch.empty_like(cu0)
 
     _kernel[(B,)](embd0, embd1, rope0, rope1, cu0, cu1, embd_out, rope_out, cu_out, D_embed, D_rope)
