@@ -2,8 +2,14 @@
 name = "tts"
 version = "0.0.1"
 dependencies = [
+    "datasets>=4.4.2",
+    "huggingface-hub>=1.2.3",
+    "ipykernel>=7.1.0",
+    "matplotlib>=3.10.8",
     "pytest>=9.0.2",
     "ruff>=0.14.10",
+    "torch>=2.9.1",
+    "torchcodec>=0.9.1",
 ]
 
 [tool.ruff]
