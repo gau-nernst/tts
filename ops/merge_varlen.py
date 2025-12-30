@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -6,113 +7,154 @@ from triton.testing import do_bench
 
 
 @triton.jit
-def _memcpy_2d(in_ptr, out_ptr, length, BLOCK_L: tl.constexpr, D: tl.constexpr):
-    l_offsets = tl.arange(0, BLOCK_L)[:, None]
-    d_offsets = tl.arange(0, D)[None, :]
+def _memcpy(in_ptr, out_ptr, size, BLOCK_SIZE: tl.constexpr):
+    offs = tl.arange(0, BLOCK_SIZE)
 
-    for i in range(tl.cdiv(length, BLOCK_L)):
-        mask = l_offsets < length
-        data = tl.load(in_ptr + l_offsets * D + d_offsets, mask=mask)
-        tl.store(out_ptr + l_offsets * D + d_offsets, data, mask=mask)
-        l_offsets += BLOCK_L
+    for _ in range(tl.cdiv(size, BLOCK_SIZE)):
+        mask = offs < size
+        data = tl.load(in_ptr + offs, mask=mask)
+        tl.store(out_ptr + offs, data, mask)
+        offs += BLOCK_SIZE
 
 
 @triton.jit
 def _kernel(
-    x0_ptr,  # [L0, D]
-    x1_ptr,  # [L1, D]
+    embd0_ptr,  # [L0, D_embed]
+    embd1_ptr,  # [L1, D_embed]
+    rope0_ptr,  # [L0, D_rope]
+    rope1_ptr,  # [L1, D_rope]
     cu0_ptr,  # [B+1]
     cu1_ptr,  # [B+1]
-    out_ptr,  # [L0+L1, D]
-    D: tl.constexpr,
-    BLOCK_L: tl.constexpr = 32,  # we might want to pick this dynamically
+    embd_out_ptr,  # [L0+L1, D_embed]
+    rope_out_ptr,  # [L0+L1, D_rope]
+    cu_out_ptr,  # [B+1]
+    D_embed: tl.constexpr,
+    D_rope: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr = 4096,
 ):
     batch_id = tl.program_id(0)
 
     start0 = tl.load(cu0_ptr + batch_id)
     start1 = tl.load(cu1_ptr + batch_id)
 
-    l0 = tl.load(cu0_ptr + batch_id + 1) - start0
-    l1 = tl.load(cu1_ptr + batch_id + 1) - start1
+    end0 = tl.load(cu0_ptr + batch_id + 1)
+    end1 = tl.load(cu1_ptr + batch_id + 1)
 
-    x0_ptr += start0 * D
-    x1_ptr += start1 * D
-    out_ptr += (start0 + start1) * D
+    start_out = start0 + start1
 
-    _memcpy_2d(x0_ptr, out_ptr, l0, BLOCK_L, D)
+    embd0_ptr += start0 * D_embed
+    embd1_ptr += start1 * D_embed
+    embd_out_ptr += start_out * D_embed
 
-    out_ptr += l0 * D
-    _memcpy_2d(x1_ptr, out_ptr, l1, BLOCK_L, D)
+    rope0_ptr += start0 * D_rope
+    rope1_ptr += start1 * D_rope
+    rope_out_ptr += start_out * D_rope
+
+    l0 = end0 - start0
+    l1 = end1 - start1
+
+    # handle cumsum
+    tl.store(cu_out_ptr + batch_id, start_out)
+    if batch_id == tl.num_programs(0) - 1:
+        tl.store(cu_out_ptr + batch_id + 1, end0 + end1)
+
+    _memcpy(embd0_ptr, embd_out_ptr, l0 * D_embed, BLOCK_SIZE)
+    _memcpy(rope0_ptr, rope_out_ptr, l0 * D_rope, BLOCK_SIZE)
+
+    embd_out_ptr += l0 * D_embed
+    rope_out_ptr += l0 * D_rope
+    _memcpy(embd1_ptr, embd_out_ptr, l1 * D_embed, BLOCK_SIZE)
+    _memcpy(rope1_ptr, rope_out_ptr, l1 * D_rope, BLOCK_SIZE)
 
 
-def merge_varlen(x0: Tensor, x1: Tensor, cu0: Tensor, cu1: Tensor):
+def merge_varlen(embd0: Tensor, embd1: Tensor, rope0: Tensor, rope1: Tensor, cu0: Tensor, cu1: Tensor):
     # we intentionally use cu (cumulative sequence length) as the auxiliary data
     # for merging because varlen attention also uses it.
-    assert x0.is_contiguous()
-    assert x1.is_contiguous()
+    assert embd0.is_contiguous()
+    assert embd1.is_contiguous()
+    assert rope0.is_contiguous()
+    assert rope1.is_contiguous()
     assert cu0.is_contiguous()
     assert cu1.is_contiguous()
-    L0, D = x0.shape
-    L1, _ = x1.shape
+    L0, D_embed = embd0.shape
+    L1, D_rope = rope1.shape
     B = cu0.shape[0] - 1
 
-    out = x0.new_empty(L0 + L1, D)
-    _kernel[(B,)](x0, x1, cu0, cu1, out, D)
-    return out
+    embd_out = embd0.new_empty(L0 + L1, D_embed)
+    rope_out = embd0.new_empty(L0 + L1, D_rope)
+    cu_out = torch.empty_like(cu0)
+
+    _kernel[(B,)](embd0, embd1, rope0, rope1, cu0, cu1, embd_out, rope_out, cu_out, D_embed, D_rope)
+
+    return embd_out, rope_out, cu_out
 
 
-def merge_varlen_ref(x0: Tensor, x1: Tensor, cu0: Tensor, cu1: Tensor):
-    x0_list = x0.split(cu0.diff().tolist())
-    x1_list = x1.split(cu1.diff().tolist())
-    return torch.cat([x for pair in zip(x0_list, x1_list) for x in pair], dim=0)
+def merge_varlen_ref(
+    embd0: Tensor, embd1: Tensor, rope0: Tensor, rope1: Tensor, cu0: Tensor, cu1: Tensor, sizes0=None, sizes1=None
+):
+    if sizes0 is None:
+        sizes0 = cu0.diff().tolist()
+    if sizes1 is None:
+        sizes1 = cu1.diff().tolist()
+
+    embd = torch.cat([x for pair in zip(embd0.split(sizes0), embd1.split(sizes1)) for x in pair], dim=0)
+    rope = torch.cat([x for pair in zip(rope0.split(sizes0), rope1.split(sizes1)) for x in pair], dim=0)
+    return embd, rope, cu0 + cu1
 
 
-def generate_test_data(B: int, dim: int, min_length: int, max_length: int, dtype: torch.dtype = torch.bfloat16):
-    x0_list = []
-    x1_list = []
-    cu0_list = [0]
-    cu1_list = [0]
+def generate_test_data(B: int, D_embed: int, min_length: int, max_length: int, dtype: torch.dtype = torch.bfloat16):
+    D_rope = 128
 
-    for _ in range(B):
-        l0 = torch.randint(5, 30, size=(1,)).item()
-        l1 = torch.randint(5, 30, size=(1,)).item()
-        x0_list.append(torch.randn(l0, dim, dtype=dtype, device="cuda"))
-        x1_list.append(torch.randn(l1, dim, dtype=dtype, device="cuda"))
-        cu0_list.append(cu0_list[-1] + l0)
-        cu1_list.append(cu1_list[-1] + l1)
+    sizes0 = torch.randint(min_length, max_length, size=(B,), device="cuda")
+    sizes1 = torch.randint(min_length, max_length, size=(B,), device="cuda")
 
-    x0 = torch.cat(x0_list, dim=0)
-    x1 = torch.cat(x1_list, dim=0)
-    cu0 = torch.tensor(cu0_list, device="cuda")
-    cu1 = torch.tensor(cu1_list, device="cuda")
-    return x0, x1, cu0, cu1
+    L0 = sizes0.sum().item()
+    L1 = sizes1.sum().item()
+
+    embd0 = torch.randn(L0, D_embed, dtype=dtype, device="cuda")
+    embd1 = torch.randn(L1, D_embed, dtype=dtype, device="cuda")
+
+    rope0 = torch.randn(L0, D_rope, dtype=dtype, device="cuda")
+    rope1 = torch.randn(L1, D_rope, dtype=dtype, device="cuda")
+
+    cu0 = F.pad(sizes0.cumsum(dim=0), (1, 0))
+    cu1 = F.pad(sizes1.cumsum(dim=0), (1, 0))
+
+    return embd0, embd1, rope0, rope1, cu0, cu1
 
 
 if __name__ == "__main__":
     import statistics
 
+    # on sufficiently large shape, our kernel is actually slower...
     B = 128
     dim = 256
     min_length = 10
     max_length = 200
 
-    x0, x1, cu0, cu1 = generate_test_data(B, dim, min_length, max_length)
-    out_ref = merge_varlen_ref(x0, x1, cu0, cu1)
-    out = merge_varlen(x0, x1, cu0, cu1)
-    assert (out == out_ref).all()
+    args = generate_test_data(B, dim, min_length, max_length)
+    out_ref = merge_varlen_ref(*args)
+    out = merge_varlen(*args)
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
 
     def benchmark(f, *args):
+        out_list = f(*args)
         latency_us = do_bench(lambda: f(*args), warmup=50, rep=100, return_mode="median") * 1e3
-        membw = (x0.nbytes + x1.nbytes + cu0.nbytes + cu1.nbytes + out_ref.nbytes) / (latency_us * 1e-6) * 1e-9
+
+        in_bytes = sum(getattr(x, "nbytes", 0) for x in args)
+        out_bytes = sum(x.nbytes for x in out_list)
+        membw = (in_bytes + out_bytes) / (latency_us * 1e-6) * 1e-9
         return latency_us, membw
 
     data_ref = []
     data = []
 
     for _ in range(10):
-        x0, x1, cu0, cu1 = generate_test_data(B, dim, min_length, max_length)
-        data_ref.append(benchmark(merge_varlen_ref, x0, x1, cu0, cu1))
-        data.append(benchmark(merge_varlen, x0, x1, cu0, cu1))
+        *args, cu0, cu1 = generate_test_data(B, dim, min_length, max_length)
+        sizes0 = cu0.diff().tolist()
+        sizes1 = cu1.diff().tolist()
+        data_ref.append(benchmark(merge_varlen_ref, *args, cu0, cu1))
+        data.append(benchmark(merge_varlen, *args, cu0, cu1))
 
     def get_stat(data: list):
         mean = statistics.mean(data)
