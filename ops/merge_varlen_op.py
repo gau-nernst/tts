@@ -18,7 +18,7 @@ def _memcpy(in_ptr, out_ptr, size, BLOCK_SIZE: tl.constexpr):
 
 
 @triton.jit
-def _kernel(
+def _forward_kernel(
     embd0_ptr,  # [L0, D_embed]
     embd1_ptr,  # [L1, D_embed]
     rope0_ptr,  # [L0, D_rope]
@@ -67,7 +67,7 @@ def _kernel(
     _memcpy(rope1_ptr, rope_out_ptr, l1 * D_rope, BLOCK_SIZE)
 
 
-def merge_varlen(embd0: Tensor, embd1: Tensor, rope0: Tensor, rope1: Tensor, cu0: Tensor, cu1: Tensor):
+def merge_varlen_forward(embd0: Tensor, embd1: Tensor, rope0: Tensor, rope1: Tensor, cu0: Tensor, cu1: Tensor):
     # we intentionally use cu (cumulative sequence length) as the auxiliary data
     # for merging because varlen attention also uses it.
     assert embd0.is_contiguous()
@@ -84,9 +84,12 @@ def merge_varlen(embd0: Tensor, embd1: Tensor, rope0: Tensor, rope1: Tensor, cu0
     rope_out = rope0.new_empty(L0 + L1, D_rope)
     cu_out = torch.empty_like(cu0)
 
-    _kernel[(B,)](embd0, embd1, rope0, rope1, cu0, cu1, embd_out, rope_out, cu_out, D_embed, D_rope)
+    _forward_kernel[(B,)](embd0, embd1, rope0, rope1, cu0, cu1, embd_out, rope_out, cu_out, D_embed, D_rope)
 
     return embd_out, rope_out, cu_out
+
+
+# TODO: implement backward
 
 
 def merge_varlen_ref(
@@ -100,6 +103,9 @@ def merge_varlen_ref(
     embd = torch.cat([x for pair in zip(embd0.split(sizes0), embd1.split(sizes1)) for x in pair], dim=0)
     rope = torch.cat([x for pair in zip(rope0.split(sizes0), rope1.split(sizes1)) for x in pair], dim=0)
     return embd, rope, cu0 + cu1
+
+
+merge_varlen = merge_varlen_ref
 
 
 def generate_test_data(B: int, D_embed: int, min_length: int, max_length: int, dtype: torch.dtype = torch.bfloat16):
@@ -134,7 +140,7 @@ if __name__ == "__main__":
 
     args = generate_test_data(B, dim, min_length, max_length)
     out_ref = merge_varlen_ref(*args)
-    out = merge_varlen(*args)
+    out = merge_varlen_forward(*args)
     torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
 
     def benchmark(f, *args):
@@ -154,7 +160,7 @@ if __name__ == "__main__":
         sizes0 = cu0.diff().tolist()
         sizes1 = cu1.diff().tolist()
         data_ref.append(benchmark(merge_varlen_ref, *args, cu0, cu1))
-        data.append(benchmark(merge_varlen, *args, cu0, cu1))
+        data.append(benchmark(merge_varlen_forward, *args, cu0, cu1))
 
     def get_stat(data: list):
         mean = statistics.mean(data)

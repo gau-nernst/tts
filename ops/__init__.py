@@ -1,2 +1,2 @@
-from .merge_varlen import merge_varlen
-from .slice_varlen import slice_varlen
+from .merge_varlen_op import merge_varlen
+from .slice_varlen_op import slice_varlen
