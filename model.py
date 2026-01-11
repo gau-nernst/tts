@@ -1,5 +1,5 @@
 # inspired by Z-Image arch
-# TODO: weight init, mixed-precision
+# TODO: weight init
 
 import dataclasses
 import math
@@ -64,13 +64,28 @@ def apply_rope(x: Tensor, rope: Tensor):
     return out.type_as(x)
 
 
+class Linear(nn.Linear):
+    """Cast weight/bias to activation dtype. Somewhat mimic FSDP2 behavior."""
+
+    def forward(self, x: Tensor):
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), b)
+
+
+class RMSNorm(nn.RMSNorm):
+    """Cast weight to activation dtype. Somewhat mimic FSDP2 behavior"""
+
+    def forward(self, x: Tensor):
+        return F.rms_norm(x, self.normalized_shape, self.weight.to(x.dtype), self.eps)
+
+
 class Attention(nn.Module):
     def __init__(self, dim: int, qk_norm: bool = False, eps: float = 1e-5) -> None:
         super().__init__()
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.o = nn.Linear(dim, dim, bias=False)
-        self.q_norm = nn.RMSNorm(128, eps=eps) if qk_norm else nn.Identity()
-        self.k_norm = nn.RMSNorm(128, eps=eps) if qk_norm else nn.Identity()
+        self.qkv = Linear(dim, dim * 3, bias=False)
+        self.o = Linear(dim, dim, bias=False)
+        self.q_norm = RMSNorm(128, eps=eps) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(128, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x: Tensor, rope: Tensor, aux_data: AttnAuxData) -> Tensor:
         q, k, v = self.qkv(x).unflatten(-1, (-1, 128)).chunk(3, dim=-2)  # each is (..., L, nH, D)
@@ -86,15 +101,15 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int) -> None:
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w1 = Linear(dim, hidden_dim, bias=False)
+        self.w3 = Linear(dim, hidden_dim, bias=False)
+        self.w2 = Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-def modulate(x: Tensor, scale: Tensor, eps: float = 1e-6):
+def modulate(x: Tensor, scale: Tensor, eps: float = 1e-6) -> Tensor:
     out = F.rms_norm(x.float(), x.shape[-1:], eps=eps)
     out = out * scale.unsqueeze(-2)
     return out.to(x.dtype)
@@ -108,11 +123,11 @@ class Block(nn.Module):
         self.eps = eps
 
         if mod_dim > 0:  # with modulation
-            self.modulation = nn.Linear(mod_dim, dim * 4)
+            self.modulation = Linear(mod_dim, dim * 4)
         else:
             self.modulation = None
-            self.attn_norm = nn.RMSNorm(dim, eps=eps)
-            self.mlp_norm = nn.RMSNorm(dim, eps=eps)
+            self.attn_norm = RMSNorm(dim, eps=eps)
+            self.mlp_norm = RMSNorm(dim, eps=eps)
 
     def forward(self, x: Tensor, rope: Tensor, aux_data: AttnAuxData, mod_input: Tensor | None = None) -> Tensor:
         if self.modulation is not None:
@@ -134,12 +149,12 @@ class Block(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, dim: int, mod_dim: int, out_dim: int) -> None:
         super().__init__()
-        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(mod_dim, dim))
-        self.linear = nn.Linear(dim, out_dim)
+        self.modulation = nn.Sequential(nn.SiLU(), Linear(mod_dim, dim))
+        self.linear = Linear(dim, out_dim)
 
     def forward(self, x: Tensor, mod_input: Tensor) -> Tensor:
-        scale = self.modulation(mod_input)
-        x = modulate(x, 1.0 + scale.float(), eps=1e-6)
+        scale = self.modulation(mod_input).float()
+        x = modulate(x, 1.0 + scale, eps=1e-6)
         return self.linear(x)
 
 
@@ -160,12 +175,12 @@ class Model(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.time_embed = nn.Sequential(nn.Linear(256, 1024), nn.SiLU(), nn.Linear(1024, cfg.t_dim))
+        self.time_embed = nn.Sequential(Linear(256, 1024), nn.SiLU(), Linear(1024, cfg.t_dim))
 
         self.text_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.text_layers = nn.ModuleList([Block(cfg.dim, 0, cfg.mlp_dim) for _ in range(cfg.text_layers)])
 
-        self.audio_embed = nn.Linear(cfg.in_dim, cfg.dim)
+        self.audio_embed = Linear(cfg.in_dim, cfg.dim)
         self.audio_layers = nn.ModuleList([Block(cfg.dim, cfg.t_dim, cfg.mlp_dim) for _ in range(cfg.audio_layers)])
 
         self.joint_layers = nn.ModuleList([Block(cfg.dim, cfg.t_dim, cfg.mlp_dim) for _ in range(cfg.joint_layers)])
@@ -179,18 +194,19 @@ class Model(nn.Module):
         text_tokens: Tensor,
         text_aux: AttnAuxData,
     ) -> Tensor:
-        time = timestep_embedding(time.squeeze(), 256).to(self.time_embed[0].weight.dtype)
+        """Expect input audio to be FP32 [-1,1]"""
+        time = timestep_embedding(time.squeeze(), 256).bfloat16()
         time = self.time_embed(time)
 
         # text-only processing
-        text = self.text_embed(text_tokens)
+        text = self.text_embed(text_tokens).bfloat16()
         text_pos_ids = F.pad(text_aux.pos_ids.unsqueeze(-1), (0, 1))  # set 2nd RoPE dim to 0
         text_rope = compute_nd_rope(text_pos_ids, self.cfg.rope_dims, theta=1e4)
         for layer in self.text_layers:
             text = layer(text, text_rope, text_aux)
 
         # audio-only processing
-        audio = self.audio_embed(audio)
+        audio = self.audio_embed(audio.float()).bfloat16()
         audio_pos_ids = F.pad(audio_aux.pos_ids.unsqueeze(-1), (1, 0))  # set 1st RoPE dim to 0
         audio_rope = compute_nd_rope(audio_pos_ids, self.cfg.rope_dims, theta=1e4)
         for layer in self.audio_layers:
@@ -213,4 +229,4 @@ class Model(nn.Module):
             joint = layer(joint, joint_rope, joint_aux, time)
 
         audio = ops.slice_varlen(joint, joint_cu, audio_aux.cu)
-        return self.output(audio, time)
+        return self.output(audio.float(), time)

@@ -1,6 +1,3 @@
-import torch
-
-
 def test_merge_varlen():
     from ops.merge_varlen_op import generate_test_data, merge_varlen_forward, merge_varlen_ref
 
